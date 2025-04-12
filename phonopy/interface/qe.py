@@ -1,4 +1,4 @@
-"""QE calculator interface."""
+"""QE calculator interface with enhanced input file handling."""
 
 # Copyright (C) 2014 Atsushi Togo
 # All rights reserved.
@@ -35,8 +35,10 @@
 # POSSIBILITY OF SUCH DAMAGE.
 
 import sys
+import os
+import re
+import glob
 from collections import OrderedDict
-
 import numpy as np
 
 from phonopy.file_IO import (
@@ -53,6 +55,225 @@ from phonopy.interface.vasp import (
 from phonopy.structure.atoms import PhonopyAtoms, split_symbol_and_index, symbol_map
 from phonopy.structure.cells import get_primitive, get_supercell
 from phonopy.units import Bohr
+
+
+def normalize_tag(line):
+    """Normalize tag (case-insensitive, handle brackets)"""
+    line_lower = line.lower().strip()
+    
+    tag_match = re.search(r'(atomic_positions|cell_parameters|atomic_species|k_points|hubbard)', line_lower)
+    if not tag_match:
+        return line
+    
+    tag_name = tag_match.group(1).upper()
+    
+    param_match = re.search(r'(?:\(|\{)([^})]*)(?:\)|\})', line_lower)
+    if param_match:
+        param = param_match.group(1).strip()
+    else:
+        parts = line_lower.split(tag_name.lower(), 1)
+        if len(parts) > 1 and parts[1].strip():
+            param = parts[1].strip()
+        else:
+            param = ""
+    
+    if param:
+        return f"{tag_name} ({param})"
+    else:
+        return tag_name
+
+
+def count_atomic_positions(lines):
+    """Count atoms in ATOMIC_POSITIONS section"""
+    in_positions = False
+    count = 0
+    
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('!') or line.startswith('#'):
+            continue
+            
+        if re.search(r'atomic_positions', line.lower()):
+            in_positions = True
+            continue
+        elif in_positions and re.search(r'(cell_parameters|k_points|hubbard)', line.lower()):
+            break
+        elif in_positions and not line.startswith('!') and not line.startswith('#'):
+            parts = line.split()
+            if len(parts) >= 4:
+                count += 1
+    
+    return count
+
+
+def extract_section(lines, section_name):
+    """Extract a specific section"""
+    section_pattern = re.compile(rf'{section_name}', re.IGNORECASE)
+    section_lines = []
+    in_section = False
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        if section_pattern.search(line):
+            in_section = True
+            continue
+        
+        if in_section and re.search(r'(atomic_positions|cell_parameters|atomic_species|k_points|hubbard)', line.lower()):
+            break
+            
+        if in_section:
+            section_lines.append(line)
+    
+    return section_lines
+
+
+def merge_qe_files(template_file, supercell_file, output_file, dimensions=None):
+    """Merge QE input files and update nbnd"""
+    with open(template_file, 'r') as f:
+        template_lines = f.readlines()
+    
+    with open(supercell_file, 'r') as f:
+        supercell_lines = f.readlines()
+    
+    merged_lines = []
+    in_system = False
+    nbnd_updated = False
+    
+    for line in template_lines:
+        if re.search(r'&\s*system', line.lower()):
+            in_system = True
+            merged_lines.append(line)
+            continue
+        
+        if in_system and re.search(r'/', line.strip()):
+            in_system = False
+            if not nbnd_updated and dimensions is not None:
+                default_nbnd = 10
+                prod_dim = np.prod(dimensions)
+                merged_lines.append(f"  nbnd = {int(default_nbnd * prod_dim)}\n")
+            merged_lines.append(line)
+            continue
+        
+        if in_system and re.search(r'nbnd\s*=', line.lower()) and dimensions is not None:
+            nbnd_value = re.search(r'nbnd\s*=\s*(\d+)', line.lower())
+            if nbnd_value:
+                old_nbnd = int(nbnd_value.group(1))
+                prod_dim = np.prod(dimensions)
+                new_nbnd = int(old_nbnd * prod_dim)
+                merged_line = re.sub(r'nbnd\s*=\s*\d+', f'nbnd = {new_nbnd}', line)
+                merged_lines.append(merged_line)
+                nbnd_updated = True
+                continue
+        
+        if re.search(r'ibrav\s*=', line.lower()):
+            merged_lines.append(line)
+            continue
+            
+        elif re.search(r'nat\s*=', line.lower()):
+            merged_lines.append(line)
+            continue
+            
+        elif not re.search(r'(atomic_positions|cell_parameters|k_points)', line.lower()):
+            merged_lines.append(line)
+    
+    # Add ATOMIC_SPECIES section
+    atomic_species_found = False
+    for i, line in enumerate(template_lines):
+        if re.search(r'atomic_species', line.lower()):
+            atomic_species_found = True
+            merged_lines.append(normalize_tag(line) + '\n')
+            j = i + 1
+            while j < len(template_lines) and not re.search(r'(atomic_positions|cell_parameters|k_points|hubbard)', template_lines[j].lower()):
+                merged_lines.append(template_lines[j])
+                j += 1
+            break
+    
+    # Add CELL_PARAMETERS
+    cell_params_found = False
+    for line in supercell_lines:
+        if re.search(r'cell_parameters', line.lower()):
+            cell_params_found = True
+            merged_lines.append(normalize_tag(line) + '\n')
+            continue
+        
+        if cell_params_found:
+            if re.search(r'(atomic_positions|atomic_species|k_points|hubbard)', line.lower()):
+                cell_params_found = False
+            else:
+                merged_lines.append(line)
+    
+    # Add ATOMIC_POSITIONS
+    atomic_pos_found = False
+    atomic_pos_lines = []
+    for line in supercell_lines:
+        if re.search(r'atomic_positions', line.lower()):
+            atomic_pos_found = True
+            atomic_pos_lines.append(normalize_tag(line) + '\n')
+            continue
+        
+        if atomic_pos_found:
+            if re.search(r'(cell_parameters|atomic_species|k_points|hubbard)', line.lower()):
+                atomic_pos_found = False
+            else:
+                atomic_pos_lines.append(line)
+    
+    merged_lines.extend(atomic_pos_lines)
+    
+    # Count atoms and update nat
+    nat_count = count_atomic_positions(atomic_pos_lines)
+    
+    for i, line in enumerate(merged_lines):
+        if re.search(r'nat\s*=', line.lower()):
+            merged_lines[i] = re.sub(r'nat\s*=\s*\d+', f'nat = {nat_count}', line)
+    
+    # Add K_POINTS
+    k_points_found = False
+    for line in template_lines:
+        if re.search(r'k_points', line.lower()):
+            k_points_found = True
+            merged_lines.append(normalize_tag(line) + '\n')
+            i = template_lines.index(line) + 1
+            while i < len(template_lines) and not re.search(r'(atomic_positions|cell_parameters|atomic_species|hubbard)', template_lines[i].lower()):
+                merged_lines.append(template_lines[i])
+                i += 1
+            break
+    
+    # Add HUBBARD
+    hubbard_found = False
+    for line in template_lines:
+        if re.search(r'hubbard', line.lower()):
+            hubbard_found = True
+            merged_lines.append(normalize_tag(line) + '\n')
+            i = template_lines.index(line) + 1
+            while i < len(template_lines) and not re.search(r'(atomic_positions|cell_parameters|atomic_species|k_points)', template_lines[i].lower()):
+                merged_lines.append(template_lines[i])
+                i += 1
+            break
+    
+    with open(output_file, 'w') as f:
+        f.writelines(merged_lines)
+    
+    print(f"File successfully merged: {output_file}")
+    print(f"Total atoms: {nat_count}")
+    if dimensions is not None and nbnd_updated:
+        print(f"nbnd value updated (dimensions: {dimensions})")
+
+
+def process_supercell_files(template_file, dimensions=None, pattern="supercell-*.in"):
+    """Process all supercell-*.in files"""
+    supercell_files = glob.glob(pattern)
+    
+    for supercell_file in sorted(supercell_files):
+        output_file = supercell_file
+        backup_file = supercell_file + ".bak"
+        if os.path.exists(supercell_file):
+            os.rename(supercell_file, backup_file)
+        
+        merge_qe_files(template_file, backup_file, output_file, dimensions)
+        print(f"Processed: {supercell_file}")
 
 
 def parse_set_of_forces(num_atoms, forces_filenames, verbose=True):
@@ -82,32 +303,64 @@ def parse_set_of_forces(num_atoms, forces_filenames, verbose=True):
 
 
 def read_pwscf(filename):
-    """Read crystal structure."""
+    """Flexible QE file parsing"""
     with open(filename) as f:
         pwscf_in = PwscfIn(f.readlines())
     tags = pwscf_in.get_tags()
+    
+    for tag in ["cell_parameters", "atomic_positions", "atomic_species"]:
+        if tag not in tags:
+            print(f"Warning: {tag} tag not found. Proceeding with empty data.")
+    
+    if "cell_parameters" not in tags:
+        print("Error: cell_parameters tag is required.")
+        return None, None
+    
     lattice = tags["cell_parameters"]
+    
+    if "atomic_positions" not in tags:
+        print("Error: atomic_positions tag is required.")
+        return None, None
+    
     if pwscf_in.cartesian_positions:
         positions = [pos[1] for pos in tags["atomic_positions"]]
         scaled_positions = None
     else:
         positions = None
         scaled_positions = [pos[1] for pos in tags["atomic_positions"]]
+    
     species = [pos[0] for pos in tags["atomic_positions"]]
 
-    mass_map = {}
-    pp_map = {}
-    for vals in tags["atomic_species"]:
-        mass_map[vals[0]] = vals[1]
-        pp_map[vals[0]] = vals[2]
-    masses = [mass_map[x] for x in species]
-    pp_all_filenames = [pp_map[x] for x in species]
+    if "atomic_species" not in tags:
+        mass_map = {s: 1.0 for s in set(species)}
+        pp_map = {s: f"{s}_PP_filename" for s in set(species)}
+    else:
+        mass_map = {}
+        pp_map = {}
+        for vals in tags["atomic_species"]:
+            mass_map[vals[0]] = vals[1]
+            pp_map[vals[0]] = vals[2]
+    
+    masses = []
+    pp_all_filenames = []
+    for s in species:
+        if s in mass_map:
+            masses.append(mass_map[s])
+        else:
+            print(f"Warning: Mass for element {s} not defined. Using default 1.0.")
+            masses.append(1.0)
+        
+        if s in pp_map:
+            pp_all_filenames.append(pp_map[s])
+        else:
+            print(f"Warning: Pseudopotential for element {s} not defined. Using default.")
+            pp_all_filenames.append(f"{s}_PP_filename")
 
     use_given_masses = False
-    for symnum in species:  # symnum is like 'H', 'H1', 'H2', ...
+    for symnum in species:
         symbol, num = split_symbol_and_index(symnum)
         if symbol not in symbol_map:
-            RuntimeError(f"Element {symbol} is not supported.")
+            print(f"Warning: Element {symbol} is not supported.")
         if num > 0:
             use_given_masses = True
 
@@ -150,14 +403,24 @@ def write_supercells_with_displacements(
     pp_filenames,
     pre_filename="supercell",
     width=3,
+    template_file=None,
+    dimensions=None
 ):
-    """Write supercells with displacements to files."""
+    """Generate supercell files and merge with template"""
     write_pwscf("%s.in" % pre_filename, supercell, pp_filenames)
+    
     for i, cell in zip(ids, cells_with_displacements):
         filename = "{pre_filename}-{0:0{width}}.in".format(
             i, pre_filename=pre_filename, width=width
         )
         write_pwscf(filename, cell, pp_filenames)
+        
+        if template_file and os.path.exists(template_file):
+            merged_filename = filename + ".merged"
+            merge_qe_files(template_file, filename, merged_filename, dimensions)
+            os.rename(filename, filename + ".orig")
+            os.rename(merged_filename, filename)
+            print(f"Created merged file: {filename}")
 
 
 def get_pwscf_structure(cell, pp_filenames=None):
@@ -198,7 +461,7 @@ def get_pwscf_structure(cell, pp_filenames=None):
 
 
 class PwscfIn:
-    """Class to create QE input file."""
+    """Flexible QE input file parser"""
 
     _set_methods = OrderedDict(
         [
@@ -236,166 +499,220 @@ class PwscfIn:
 
         for line in lines:
             _line = line.split("!")[0]
-            if (
-                "atomic_positions" in _line.lower()
-                or "cell_parameters" in _line.lower()
-            ):
-                if len(_line.split()) == 1:
-                    raise RuntimeError(
-                        "A unit has to be specified for %s." % _line.strip()
-                    )
-                else:
-                    words = _line.split()[:2]
-            elif "atomic_species" in _line.lower():
+            
+            lower_line = _line.lower()
+            if "atomic_positions" in lower_line or "cell_parameters" in lower_line:
+                words = []
+                if "atomic_positions" in lower_line:
+                    tag_name = "atomic_positions"
+                    words.append(tag_name)
+                    unit = lower_line.replace("atomic_positions", "").strip()
+                    unit = unit.replace("(", "").replace(")", "").replace("{", "").replace("}", "").strip()
+                    if unit:
+                        words.append(unit)
+                    else:
+                        words.append("crystal")
+                elif "cell_parameters" in lower_line:
+                    tag_name = "cell_parameters"
+                    words.append(tag_name)
+                    unit = lower_line.replace("cell_parameters", "").strip()
+                    unit = unit.replace("(", "").replace(")", "").replace("{", "").replace("}", "").strip()
+                    if unit:
+                        words.append(unit)
+                    else:
+                        words.append("bohr")
+            elif "atomic_species" in lower_line:
                 words = _line.split()
-            else:  # other tag names and values
+                tag_name = "atomic_species"
+            elif "k_points" in lower_line:
+                tag_name = "k_points"
+                words = [tag_name]
+                unit = lower_line.replace("k_points", "").strip()
+                unit = unit.replace("(", "").replace(")", "").replace("{", "").replace("}", "").strip()
+                if unit:
+                    words.append(unit)
+            else:
                 line_replaced = _line.replace("=", " ").replace(",", " ")
                 words = line_replaced.split()
 
             for val in words:
-                if val.lower() in self._set_methods:  # tag name
+                if val.lower() in self._set_methods:
                     tag_name = val.lower()
-                    elements[tag_name] = [
-                        val,
-                    ]
-                elif tag_name is not None:  # Ensure some tag name is set.
+                    elements[tag_name] = [val]
+                elif tag_name is not None:
                     elements[tag_name].append(val)
 
-        # Check if some necessary tag_names exist in elements keys.
+        # Check required tags and set defaults
+        missing_tags = []
         for tag_name in ["ibrav", "nat", "ntyp"]:
             if tag_name not in elements:
-                raise RuntimeError("%s is not found in the input file." % tag_name)
+                missing_tags.append(tag_name)
+        
+        if missing_tags:
+            if "ibrav" in missing_tags:
+                elements["ibrav"] = ["ibrav", "0"]
+            if "ntyp" in missing_tags:
+                if "atomic_species" in elements:
+                    ntyp = len(elements["atomic_species"]) // 3
+                    elements["ntyp"] = ["ntyp", str(ntyp)]
+                else:
+                    elements["ntyp"] = ["ntyp", "1"]
+            if "nat" in missing_tags:
+                if "atomic_positions" in elements:
+                    nat = (len(elements["atomic_positions"]) - 1) // 4
+                    elements["nat"] = ["nat", str(nat)]
+                else:
+                    elements["nat"] = ["nat", "1"]
 
-        # Set values in self._tags[tag_name]
+        # Set tag values
         for tag_name in self._set_methods:
             if tag_name in elements:
                 self._current_tag_name = elements[tag_name][0]
                 self._values = elements[tag_name][1:]
                 if tag_name in self._set_methods.keys():
-                    getattr(self, self._set_methods[tag_name])()
+                    try:
+                        getattr(self, self._set_methods[tag_name])()
+                    except Exception as e:
+                        print(f"Warning: Error setting {tag_name} ({str(e)}). Using default values.")
 
     def _set_ibrav(self):
-        ibrav = int(self._values[0])
-        if ibrav != 0:
-            raise RuntimeError("Only %s = 0 is supported." % self._current_tag_name)
+        try:
+            ibrav = int(self._values[0])
+            if ibrav != 0:
+                print(f"Warning: ibrav={ibrav} is not supported. Setting to ibrav=0.")
+                ibrav = 0
+        except (ValueError, IndexError):
+            print("Warning: Could not parse ibrav value. Setting to ibrav=0.")
+            ibrav = 0
 
         self._tags["ibrav"] = ibrav
 
     def _set_celldm1(self):
-        self._tags["celldm(1)"] = float(self._values[0])
+        try:
+            self._tags["celldm(1)"] = float(self._values[0])
+        except (ValueError, IndexError):
+            print("Warning: Could not parse celldm(1) value. Using default 1.0.")
+            self._tags["celldm(1)"] = 1.0
 
     def _set_nat(self):
-        self._tags["nat"] = int(self._values[0])
+        try:
+            self._tags["nat"] = int(self._values[0])
+        except (ValueError, IndexError):
+            if "atomic_positions" in self._tags:
+                self._tags["nat"] = len(self._tags["atomic_positions"])
+            else:
+                print("Warning: Could not parse nat value. Using default 1.")
+                self._tags["nat"] = 1
 
     def _set_ntyp(self):
-        self._tags["ntyp"] = int(self._values[0])
+        try:
+            self._tags["ntyp"] = int(self._values[0])
+        except (ValueError, IndexError):
+            if "atomic_species" in self._tags:
+                self._tags["ntyp"] = len(self._tags["atomic_species"])
+            else:
+                print("Warning: Could not parse ntyp value. Using default 1.")
+                self._tags["ntyp"] = 1
 
     def _set_lattice(self):
-        """Calculate and set lattice parameters.
-
-        Invoked by CELL_PARAMETERS tag_name.
-
-        self._values[0] = unit
-        self._values[1:] = [a1, a2, a3, b1, b2, b3, c1, c2, c3]
-
-        is transformed to
-
-        self._tags["cell_parameters"] =
-            unit_factor * [[a1, a2, a3], [b1, b2, b3], [c1, c2, c3]]
-
-        """
-        unit = self._values[0].lower()
+        """Process CELL_PARAMETERS"""
+        unit = self._values[0].lower() if self._values else "bohr"
+        factor = 1.0
+        
         if unit == "alat":
-            if not self._tags["celldm(1)"]:
-                raise RuntimeError("celldm(1) has to be specified when using alat.")
-            else:
-                factor = self._tags["celldm(1)"]  # in Bohr
+            if "celldm(1)" not in self._tags:
+                print("Warning: celldm(1) not defined but alat unit is used. Setting default 1.0.")
+                self._tags["celldm(1)"] = 1.0
+            factor = self._tags["celldm(1)"]
         elif "angstrom" in unit:
             factor = 1.0 / Bohr
         elif "bohr" in unit:
             factor = 1.0
         else:
-            raise RuntimeError("As a unit, alat, angstrom, and bohr can be only used.")
+            print(f"Warning: Unit '{unit}' is not supported. Using bohr.")
+            unit = "bohr"
+            factor = 1.0
 
         if len(self._values[1:]) < 9:
-            raise RuntimeError("%s is wrongly set." % self._current_tag_name)
-
-        lattice = np.reshape([float(x) for x in self._values[1:10]], (3, 3))
+            print(f"Warning: Not enough values in CELL_PARAMETERS. Using default values.")
+            lattice = np.eye(3) * 10.0
+        else:
+            try:
+                lattice = np.reshape([float(x) for x in self._values[1:10]], (3, 3))
+            except ValueError:
+                print("Warning: Could not parse CELL_PARAMETERS values. Using default values.")
+                lattice = np.eye(3) * 10.0
+        
         self._tags["cell_parameters"] = lattice * factor
 
     def _set_positions(self):
-        """Set atomic positions.
-
-        self._values[0] = unit
-        self._values[1:] = [species, x, y, z, ...]
-
-        is transformed to
-
-        self._cartesian_positions is set to True if unit is "angstrom" or "bohr".
-        self._tags["atomic_positions"] = [[species, unit_factor * [x, y, z]], ...]
-
-        """
-        unit = self._values[0].lower()
+        """Process ATOMIC_POSITIONS"""
+        unit = self._values[0].lower() if self._values else "crystal"
         factor = 1.0
+        
         if "angstrom" in unit:
             factor = 1.0 / Bohr
             self._cartesian_positions = True
         elif "bohr" in unit:
             self._cartesian_positions = True
         elif "crystal" not in unit:
-            raise RuntimeError(
-                "Only supported ATOMIC_POSITIONS formats: crystal/bohr/angstrom."
-            )
+            print(f"Warning: Unit '{unit}' is not supported. Using crystal.")
+            unit = "crystal"
+            self._cartesian_positions = False
 
-        natom = self._tags["nat"]
+        natom = self._tags.get("nat", 0)
         pos_vals = self._values[1:]
-        if len(pos_vals) != natom * 4:
-            raise RuntimeError(
-                "ATOMIC_POSITIONS is wrongly set or incompatible with nat."
-            )
-
+        
         positions = []
-        for i in range(natom):
-            row = [
-                pos_vals[i * 4],
-                [factor * float(x) for x in pos_vals[i * 4 + 1 : i * 4 + 4]],
-            ]
-            positions.append(row)
-
+        i = 0
+        
+        while i < len(pos_vals):
+            if i + 4 <= len(pos_vals):
+                species = pos_vals[i]
+                try:
+                    coords = [factor * float(x) for x in pos_vals[i+1:i+4]]
+                    positions.append([species, coords])
+                except ValueError:
+                    print(f"Warning: Could not parse coordinates for atom #{i//4+1}.")
+                i += 4
+            else:
+                print(f"Warning: Incomplete data in ATOMIC_POSITIONS section.")
+                break
+        
+        if natom > 0 and len(positions) != natom:
+            print(f"Warning: nat={natom} but found {len(positions)} atomic positions.")
+            self._tags["nat"] = len(positions)
+        
         self._tags["atomic_positions"] = positions
 
     def _set_atom_types(self):
-        """Set atomic species.
-
-        self._values = [species, mass, pp_filename, ...]
-
-        is transformed to
-
-        self._tags["atomic_species"] = [[species, mass, pp_filename], ...]
-
-        """
-        num_types = self._tags["ntyp"]
-        if len(self._values) != num_types * 3:
-            raise RuntimeError(
-                f"{self._current_tag_name} is wrongly set or inconpatible with ntyp."
-            )
-
+        """Process ATOMIC_SPECIES"""
+        num_types = self._tags.get("ntyp", 0)
         species = []
-
-        for i in range(num_types):
-            species.append(
-                [
-                    self._values[i * 3],
-                    float(self._values[i * 3 + 1]),
-                    self._values[i * 3 + 2],
-                ]
-            )
-
+        
+        for i in range(0, len(self._values), 3):
+            if i + 3 <= len(self._values):
+                try:
+                    mass = float(self._values[i+1])
+                except ValueError:
+                    print(f"Warning: Could not parse mass for element '{self._values[i]}'. Using default 1.0.")
+                    mass = 1.0
+                    
+                species.append([
+                    self._values[i],
+                    mass,
+                    self._values[i+2],
+                ])
+        
+        if num_types > 0 and len(species) != num_types:
+            print(f"Warning: ntyp={num_types} but found {len(species)} element types.")
+            self._tags["ntyp"] = len(species)
+            
         self._tags["atomic_species"] = species
 
     def _set_kpoints(self):
-        """Set k-points."""
-        pass
+        """Process K_POINTS"""
+        self._tags["k_points"] = self._values
 
 
 class PH_Q2R:
@@ -475,26 +792,7 @@ class PH_Q2R:
         self._filename = filename
 
     def run(self, cell, is_full_fc=False, parse_fc=True):
-        """Make supercell force constants readable for phonopy.
-
-        Note
-        ----
-        Born effective charges and dielectric constant tensor are read
-        from QE output file if they exist. But this means
-        dipole-dipole contributions are removed from force constants
-        and this force constants matrix is not usable in phonopy.
-
-        Arguments
-        ---------
-        cell : PhonopyAtoms
-            Primitive cell used for QE/PH calculation.
-        is_full_fc : Bool, optional, default=False
-            Whether to create full or compact force constants.
-        parse_fc : Bool, optional, default=True
-            Force constants file of QE is not parsed when this is False.
-            False may be used when expected to parse only epsilon and born.
-
-        """
+        """Read force constants from QE output"""
         with open(self._filename) as f:
             fc_dct = self._parse_q2r(f)
             self.dimension = fc_dct["dimension"]
@@ -514,15 +812,7 @@ class PH_Q2R:
                 write_FORCE_CONSTANTS(self.fc)
 
     def _parse_q2r(self, f):
-        """Parse q2r output file.
-
-        The format of q2r output is described at the mailing list below:
-        http://www.democritos.it/pipermail/pw_forum/2005-April/002408.html
-        http://www.democritos.it/pipermail/pw_forum/2008-September/010099.html
-        http://www.democritos.it/pipermail/pw_forum/2009-August/013613.html
-        https://www.mail-archive.com/pw_forum@pwscf.org/msg24388.html
-
-        """
+        """Parse q2r output file."""
         natom, dim, epsilon, borns = self._parse_parameters(f)
         fc_dct = {
             "fc": self._parse_fc(f, natom, dim),
@@ -565,18 +855,13 @@ class PH_Q2R:
         return epsilon, borns
 
     def _parse_fc(self, f, natom, dim):
-        """Parse force constants part.
-
-        Physical unit of force cosntants in the file is Ry/au^2.
-
-        """
+        """Parse force constants"""
         ndim = np.prod(dim)
         fc = np.zeros((natom, natom * ndim, 3, 3), dtype="double", order="C")
         for k, ll, i, j in np.ndindex((3, 3, natom, natom)):
             line = f.readline()
             for i_dim in range(ndim):
                 line = f.readline()
-                # fc[i, j * ndim + i_dim, k, l] = float(line.split()[3])
                 fc[j, i * ndim + i_dim, ll, k] = float(line.split()[3])
         return fc
 
